@@ -1,0 +1,58 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: bash
+        run: pip install pyinstaller pymem
+
+      - name: Determine version
+        shell: bash
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            DATE=$(date +%Y%m%d)
+            VERSION="dev-${SHORT_SHA}-${DATE}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version: $VERSION"
+
+      - name: Build exe with PyInstaller
+        shell: bash
+        run: pyinstaller --onefile --console --name memscan cli.py
+
+      - name: Rename exe with platform and version
+        shell: bash
+        run: |
+          mv dist/memscan.exe "dist/memscan-windows-${{ steps.version.outputs.version }}.exe"
+          ls dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: memscan-windows-${{ steps.version.outputs.version }}
+          path: dist/memscan-windows-${{ steps.version.outputs.version }}.exe
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/memscan-windows-${{ steps.version.outputs.version }}.exe
