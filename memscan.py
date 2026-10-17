@@ -29,6 +29,10 @@ def parse_transform(expr):
     """解析数值变换表达式，如 "*8"、"*8+10"、"/2-5"。
     很多游戏不存原值，存的是变换后的值（防内存修改的最简手段）。
     返回 (to_stored, to_display) 两个函数。
+
+    注意："/" 是向下取整除法，单向有损，不可逆。
+    如显示值 5、"/2" → 内存 2 → 显示回来是 4 ≠ 5。
+    需要精确往返时别用 "/"。
     """
     tokens = re.findall(r'([*/+-])(\d+)', expr.replace(' ', ''))
     if not tokens or ''.join(o + n for o, n in tokens) != expr.replace(' ', ''):
@@ -74,18 +78,65 @@ def unpack_value(buf, vtype):
     return struct.unpack(fmt, buf)[0]
 
 
+# 单次首搜命中上限：搜 0/1 这类常见值时，零页能产出上亿个命中，
+# 全收进列表会吃掉几个 GB 内存。超了就停，提示用户先去游戏里改变数值。
+MAX_FIRST_SCAN_HITS = 200_000
+
+
+def normalize_value(value, vtype):
+    """把用户输入按类型规整：整数类型且值是整数时转 int。
+    CLI 传进来的是 float（如 500.0），直接 struct.pack('<i', 500.0)
+    会抛 struct.error。"""
+    if vtype != 'f32':
+        f = float(value)
+        if f.is_integer():
+            return int(f)
+    return value
+
+
+def _scan_pointers(backend, target_addr, ptr_size=8):
+    """指针扫描通用逻辑：在后端内存里找"值 == target_addr"的地址。
+    返回的每个地址，读出来都是 target_addr——顺着它们能反推出
+    "谁引用了目标"，是做指针链的第一步。"""
+    needle = struct.pack('<Q' if ptr_size == 8 else '<I', target_addr)
+    found = []
+    for start, end in backend.regions():
+        addr = start
+        CHUNK = 1 << 20
+        while addr < end:
+            chunk_end = min(addr + CHUNK, end)
+            buf = backend.read(addr, chunk_end - addr)
+            if buf:
+                off = 0
+                while True:
+                    idx = buf.find(needle, off)
+                    if idx < 0:
+                        break
+                    # 指针按 ptr_size 对齐才算（减少误报）
+                    if (addr + idx) % ptr_size == 0:
+                        found.append(addr + idx)
+                    off = idx + 1
+            addr = chunk_end
+    return found
+
+
 class LinuxBackend:
     """Linux 后端：读写 /proc/<pid>/mem。root 或同用户一般可直接用。"""
 
     def __init__(self, pid):
         self.pid = pid
         self.fd = os.open(f"/proc/{pid}/mem", os.O_RDWR)
+        # 开关：True 时 regions() 也返回文件映射（主程序/.so 的 .data/.bss）。
+        # 默认 False 求快（动态数值一般在堆/匿名内存里）。
+        self.include_mapped = False
 
     def regions(self):
-        """解析 /proc/<pid>/maps，只返回可读写的匿名内存区间。
+        """解析 /proc/<pid>/maps，只返回可读写的内存区间。
 
-        跳过 .so / 可执行文件等文件映射——要改的动态数值
+        默认跳过 .so / 可执行文件等文件映射——要改的动态数值
         （血量、金币）一般都在堆 / 匿名内存里，这样扫得快。
+        置 include_mapped=True 可把文件映射也纳入（会变慢，
+        但能搜到主程序 .data/.bss 里的数值）。
         """
         out = []
         with open(f"/proc/{self.pid}/maps") as f:
@@ -97,7 +148,8 @@ class LinuxBackend:
                 if 'r' not in perms or 'w' not in perms:
                     continue
                 pathname = parts[5] if len(parts) > 5 else ''
-                if pathname and not pathname.startswith('['):
+                if (not self.include_mapped and pathname
+                        and not pathname.startswith('[')):
                     continue  # 跳过文件映射
                 s, e = addrs.split('-')
                 start, end = int(s, 16), int(e, 16)
@@ -120,31 +172,8 @@ class LinuxBackend:
 
     def find_pointers(self, target_addr, ptr_size=8):
         """找指向 target_addr 的指针（一级指针扫描）。
-
-        在可写内存里搜"值 == target_addr"的地址。
-        返回的每个地址，读出来都是 target_addr——
-        顺着它们能反推出"谁引用了目标"，是做指针链的第一步。
-        """
-        needle = struct.pack('<Q' if ptr_size == 8 else '<I', target_addr)
-        found = []
-        for start, end in self.regions():
-            addr = start
-            CHUNK = 1 << 20
-            while addr < end:
-                chunk_end = min(addr + CHUNK, end)
-                buf = self.read(addr, chunk_end - addr)
-                if buf:
-                    off = 0
-                    while True:
-                        idx = buf.find(needle, off)
-                        if idx < 0:
-                            break
-                        # 指针按 ptr_size 对齐才算（减少误报）
-                        if (addr + idx) % ptr_size == 0:
-                            found.append(addr + idx)
-                        off = idx + 1
-                addr = chunk_end
-        return found
+        在可写内存里搜"值 == target_addr"的地址。"""
+        return _scan_pointers(self, target_addr, ptr_size)
 
     def close(self):
         os.close(self.fd)
@@ -163,6 +192,9 @@ class WindowsBackend:
     def __init__(self, process_name):
         from pymem import Pymem
         self.pm = Pymem(process_name)
+        # 与 LinuxBackend 对齐的开关；Windows 用 VirtualQueryEx 本来就
+        # 覆盖全部已提交页，这里是 no-op，仅为接口一致。
+        self.include_mapped = False
 
     def regions(self):
         """用 VirtualQueryEx 枚举可读写已提交内存页。"""
@@ -217,6 +249,10 @@ class WindowsBackend:
         except Exception:
             return False
 
+    def find_pointers(self, target_addr, ptr_size=8):
+        """找指向 target_addr 的指针（一级指针扫描，分块读实现）。"""
+        return _scan_pointers(self, target_addr, ptr_size)
+
     def close(self):
         self.pm.close_process()
 
@@ -230,14 +266,17 @@ class Scanner:
         self._last = {}  # addr -> 上轮扫描到的值（差值过滤用）
 
     def first_scan(self, value, vtype='i32'):
-        """全内存首搜：找出所有"当前值 == value"的地址。"""
+        """全内存首搜：找出所有"当前值 == value"的地址。
+        命中超过 MAX_FIRST_SCAN_HITS 时提前停并提示
+        （搜 0/1 这类值会内存爆炸）。"""
         needle = pack_value(value, vtype)
         size = len(needle)
         found = []
+        overflow = False
         for start, end in self.backend.regions():
             addr = start
             CHUNK = 1 << 20  # 1MB 分块，避免单次读太大
-            while addr < end:
+            while addr < end and not overflow:
                 chunk_end = min(addr + CHUNK, end)
                 buf = self.backend.read(addr, chunk_end - addr)
                 if buf:
@@ -247,11 +286,19 @@ class Scanner:
                         if idx < 0:
                             break
                         found.append(addr + idx)
+                        if len(found) >= MAX_FIRST_SCAN_HITS:
+                            overflow = True
+                            break
                         off = idx + 1
                 if chunk_end >= end:
                     break  # 已到区间末尾，不再回退（否则死循环）
                 # 回退 size-1 字节，防止目标横跨两个块时漏检
                 addr = chunk_end - (size - 1)
+            if overflow:
+                break
+        if overflow:
+            print(f"⚠️ 命中超过 {MAX_FIRST_SCAN_HITS} 个，已停止收集。"
+                  "先去游戏里改变数值，再用 next_scan 过滤这批候选。")
         # 去重（回退导致重叠区会重复命中）
         seen, uniq = set(), []
         for a in found:
@@ -324,16 +371,32 @@ class Scanner:
         return self.candidates
 
     def first_scan_multi(self, value):
-        """向导用：对 i32/u32/f32/i64 并行首搜，返回 {类型: 候选数}。
-        用户不用猜类型，哪个收敛看哪个。"""
+        """向导用：对 i32/u32/f32/i64 首搜，返回 {类型: 候选}。
+        用户不用猜类型，哪个收敛看哪个。
+        - 用户输入是 float（如 500.0），整数类型先规整成 int，
+          否则 struct.pack('<i', 500.0) 抛 struct.error
+        - 字节完全相同的 needle（如 500 的 i32/u32）只扫一次，共享结果
+        - 结束后清空 _last：它只剩最后一次扫描的类型快照，
+          留下会让后续 next_scan_delta 用错基线"""
         result = {}
+        done_needles = {}  # needle bytes -> 已扫过的 vtype
         for vtype in ('i32', 'u32', 'f32', 'i64'):
+            v = normalize_value(value, vtype)
             try:
-                c = self.first_scan(value, vtype)
+                needle = pack_value(v, vtype)
             except (struct.error, OverflowError):
                 result[vtype] = []
                 continue
-            result[vtype] = c
+            if needle in done_needles:
+                result[vtype] = list(result[done_needles[needle]])
+                continue
+            done_needles[needle] = vtype
+            try:
+                result[vtype] = self.first_scan(v, vtype)
+            except (struct.error, OverflowError):
+                result[vtype] = []
+        self._last = {}
+        self.candidates = []  # 与 _last 保持一致，避免残留上一轮 i64 候选
         return result
 
     def next_scan_multi(self, prev, value):
@@ -343,7 +406,8 @@ class Scanner:
         for vtype, addrs in prev.items():
             self.candidates = list(addrs)
             try:
-                result[vtype] = self.next_scan(value, vtype)
+                result[vtype] = self.next_scan(
+                    normalize_value(value, vtype), vtype)
             except (struct.error, OverflowError):
                 result[vtype] = []
         self.candidates = []
@@ -361,8 +425,8 @@ class Scanner:
                 chunk_end = min(addr + CHUNK, end)
                 buf = self.backend.read(addr, chunk_end - addr)
                 if buf:
-                    # 按 4 字节对齐步进（实际数值都是对齐存放的）
-                    for off in range(0, len(buf) - size + 1, 4):
+                    # 按类型宽度步进（实际数值都是按自身宽度对齐存放的）
+                    for off in range(0, len(buf) - size + 1, size):
                         v = struct.unpack_from(fmt, buf, off)[0]
                         if abs(v - value) < epsilon:
                             found.append(addr + off)

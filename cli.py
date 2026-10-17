@@ -18,13 +18,14 @@ memscan 交互式命令行 —— CE 替代版的操作台。
   load <文件>          加载 CT 表并自动锁定其中标记的项
   pointers <序号>      找指向该地址的指针
   type <类型>          设置默认类型（i32/u32/f32/i64）
+  mapped on|off        是否扫描文件映射（.data/.bss），默认 off 求快
   quit                 退出
 """
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from memscan import LinuxBackend, WindowsBackend, Scanner
+from memscan import LinuxBackend, WindowsBackend, Scanner, unpack_value
 import cheattable
 from locker import Locker
 from unknown_scan import UnknownScanner
@@ -93,23 +94,25 @@ class Shell:
 
     def _find_round(self, _v0):
         while True:
-            # 哪个类型收敛得最好，推荐哪个
-            best = min(self.multi.items(), key=lambda kv: len(kv[1]))
+            # 哪个类型收敛得最好，推荐哪个——只看非空的，
+            # 不然会"假收敛"到 0 候选的类型
+            nonempty = [(t, c) for t, c in self.multi.items() if c]
             total = sum(len(c) for c in self.multi.values())
-            if total == 0:
+            if not nonempty:
                 print("所有类型都没命中，数值输错了？重来：find")
                 self.multi = {}
                 return
-            if len(best[1]) <= 3:
-                self.candidates = [(a, best[0]) for a in best[1]]
-                self.sc.set_candidates(best[1], best[0])  # 重建差值跟踪
+            best_t, best_c = min(nonempty, key=lambda kv: len(kv[1]))
+            if len(best_c) <= 3:
+                self.candidates = [(a, best_t) for a in best_c]
+                self.sc.set_candidates(best_c, best_t)  # 重建差值跟踪
                 self.transform = None
-                print(f"\n✅ 锁定类型 {best[0]}，剩 {len(best[1])} 个候选：")
+                print(f"\n✅ 锁定类型 {best_t}，剩 {len(best_c)} 个候选：")
                 self.cmd_list("")
                 print("用 write <序号> <值> 修改，或 lock <序号> <值> 锁定")
                 self.multi = {}
                 return
-            print(f"\n当前最有希望：{best[0]}（{len(best[1])} 个），"
+            print(f"\n当前最有希望：{best_t}（{len(best_c)} 个），"
                   f"共 {total} 个候选")
             nxt = input("去游戏里改变数值，输入新数值后回车（q 退出）：").strip()
             if nxt.lower() == 'q':
@@ -319,15 +322,34 @@ class Shell:
         else:
             print("用法：type <i32|u32|f32|i64>")
 
+    def cmd_mapped(self, arg):
+        """mapped on|off：扫描时是否包含文件映射（主程序/.so 的 .data/.bss）。
+        默认 off（只扫匿名内存，速度快）。"""
+        if not self._need():
+            return
+        arg = arg.strip().lower()
+        if arg == "on":
+            self.backend.include_mapped = True
+            print("已开启：扫描包含文件映射（.data/.bss），会变慢")
+        elif arg == "off":
+            self.backend.include_mapped = False
+            print("已关闭：只扫匿名内存（默认，速度快）")
+        else:
+            cur = "on" if getattr(self.backend, "include_mapped",
+                                  False) else "off"
+            print(f"当前：{cur}。用法：mapped on|off")
+
     # ---------- CT 表 ----------
     def cmd_save(self, arg):
-        path = arg.strip() or "cheatable.json"
+        path = arg.strip() or "cheatable.ct"
         entries = []
         for i, (a, t) in enumerate(self.candidates):
             entries.append(cheattable.entry(f"addr_{i}", a, t))
         for a, (data, t) in self.locker.list().items():
+            # 把锁定值也存进去：load 时优先用它，而不是读"当前值"
             entries.append(cheattable.entry(f"lock_{a:x}", a, t,
-                                           locked=True))
+                                           locked=True,
+                                           lock_value=unpack_value(data, t)))
         cheattable.save(path, entries)
         self.table_path = path
         print(f"✅ 已保存 {len(entries)} 项到 {path}")
@@ -335,8 +357,10 @@ class Shell:
     def cmd_load(self, arg):
         if not self._need():
             return
-        path = arg.strip() or "cheatable.json"
+        path = arg.strip() or "cheatable.ct"
         entries = cheattable.load(path)
+        if cheattable.last_warnings:
+            print(f"⚠️ 跳过 {len(cheattable.last_warnings)} 条（不支持的类型/符号地址）")
         if not entries:
             print(f"{path} 为空或不存在")
             return
@@ -345,10 +369,12 @@ class Shell:
         n_lock = 0
         for e in entries:
             if e.get("locked"):
-                # lock_value 没存的话，读当前值锁定
                 a = int(e["addr"], 16)
                 t = e.get("vtype", "i32")
-                v = self.sc.read(a, t)
+                # 优先用存档里的 lock_value；老存档没存才退化为读当前值
+                v = e.get("lock_value")
+                if v is None:
+                    v = self.sc.read(a, t)
                 if v is not None:
                     self.locker.add(a, v, t)
                     n_lock += 1
@@ -372,7 +398,7 @@ class Shell:
 
     # ---------- 主循环 ----------
     CMDS = ("attach find ufind findx list write writex lock unlock locks "
-            "by save load pointers type quit help").split()
+            "by save load pointers type mapped quit help").split()
 
     def cmd_help(self, _arg):
         print("命令: " + ", ".join(self.CMDS))

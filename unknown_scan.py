@@ -18,14 +18,22 @@ class UnknownScanner:
         self.candidates = []  # 当前候选地址列表（多轮比较时用）
 
     def snapshot(self):
-        """拍下当前可写内存快照。返回快照总字节数。"""
+        """拍下当前可写内存快照。返回快照总字节数。
+        按 1MB 分块读：区间里有个洞（guard page、未提交页）只丢
+        这一块，而不是整个区间被静默丢弃。"""
         self.snapshots = []
         total = 0
+        CHUNK = 1 << 20
         for start, end in self.backend.regions():
-            buf = self.backend.read(start, end - start)
-            if buf:
-                self.snapshots.append((start, buf))
-                total += len(buf)
+            addr = start
+            while addr < end:
+                chunk_end = min(addr + CHUNK, end)
+                buf = self.backend.read(addr, chunk_end - addr)
+                if buf and len(buf) == chunk_end - addr:
+                    self.snapshots.append((addr, buf))
+                    total += len(buf)
+                # 短读/读失败：只跳过这一块
+                addr = chunk_end
         self.candidates = []
         return total
 
